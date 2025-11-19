@@ -26,8 +26,8 @@ const getDistance = (p1, p2) => {
 };
 
 // --- CONFIGURATION ---
-const WORLD_SIZE = 900; 
-const PORTAL_BOX = { x: 50, y: 50, w: 100, h: 100 }; 
+const WORLD_SIZE = 1200; 
+const PORTAL_BOX = { x: 300, y: 50, w: 200, h: 200 }; 
 
 const COUNTDOWN_SECONDS = 10;
 const MIN_PLAYERS_TO_START = 3; 
@@ -201,7 +201,6 @@ function createAnokoAnimations() {
         walkRight: new FrameIndexPattern(ANOKO_WALK),
         standLeft: new FrameIndexPattern(ANOKO_STAND),
         walkLeft: new FrameIndexPattern(ANOKO_WALK), 
-        
         cry: new FrameIndexPattern(ANOKO_STAND),
         dance: new FrameIndexPattern(ANOKO_WALK), 
         sit: new FrameIndexPattern(ANOKO_STAND),
@@ -213,8 +212,9 @@ function createAnokoAnimations() {
 export default function Game({ session }) {
     const canvasRef = useRef(null);
     const myId = session.user.id; 
+    
+    const winTriggeredRef = useRef(false);
 
-    // --- ENGINE REFS ---
     const engineRef = useRef({
         input: new Input(),
         camera: new Camera(VIEW_WIDTH, VIEW_HEIGHT),
@@ -252,28 +252,22 @@ export default function Game({ session }) {
     };
 
     const createAnokoSprite = () => {
-        // Fallback checks to ensure visibility
         if (!resources.images.anoko) {
             console.warn("Anoko image missing! Falling back.");
             const s = createChiikawaSprite();
             s.scale = 3; 
             return s;
         }
-        
         if (resources.images.anoko.isLoaded && resources.images.anoko.image.width < 200) {
              console.warn("Anoko image dimensions suspicious. Falling back.");
              const s = createChiikawaSprite();
              s.scale = 3; 
              return s;
         }
-
         const s = new Sprite({
             resource: resources.images.anoko, 
             frameSize: new Vector2(200, 200),
-            hFrames: 6, 
-            vFrames: 1, 
-            scale: 1, 
-            animations: null 
+            hFrames: 6, vFrames: 1, scale: 1, animations: null 
         });
         s.animations = createAnokoAnimations();
         return s;
@@ -285,13 +279,26 @@ export default function Game({ session }) {
     };
 
     const triggerSurvivorWin = async () => {
+        if (winTriggeredRef.current) return; 
+        winTriggeredRef.current = true; 
         console.log("Triggering Survivor Win");
-        await supabase.rpc('trigger_survivor_win');
+        
+        const { error } = await supabase.rpc('trigger_survivor_win');
+        if (error) {
+            console.error("RPC Error, falling back:", error);
+            await supabase.from('game_state').update({ winner: 'survivors', is_active: false }).eq('id', 1);
+        }
     };
 
     const triggerItWin = async () => {
+        if (winTriggeredRef.current) return; 
+        winTriggeredRef.current = true;
         console.log("Triggering IT Win");
-        await supabase.from('game_state').update({ winner: 'it' }).eq('id', 1);
+        
+        const { error } = await supabase.rpc('trigger_it_win');
+        if (error) {
+             await supabase.from('game_state').update({ winner: 'it', is_active: false }).eq('id', 1);
+        }
     };
 
     const leaveDungeon = async () => {
@@ -331,20 +338,21 @@ export default function Game({ session }) {
 
     const checkDungeonDisconnectWin = () => {
         const gs = engineRef.current.gameState;
-        if (!gs.isActive || gs.winner) return;
+        if (!gs.isActive || gs.winner || winTriggeredRef.current) return;
 
         const players = Object.values(engineRef.current.players);
         const dungeonPlayers = players.filter(p => p.lobby_id === 'dungeon' && p.status === 'alive');
 
+        // Check if IT is present in the dungeon
         const itExists = dungeonPlayers.some(p => p.is_it);
         
-        // IT Disconnected -> Survivors Win
+        // If IT Disconnected (No IT found in dungeon players) -> Survivors Win
         if (!itExists && dungeonPlayers.length > 0) {
             triggerSurvivorWin();
             return;
         }
         
-        // Survivors Disconnected -> IT Wins
+        // If ALL Survivors Disconnected (Only IT found) -> IT Wins
         const survivorsExist = dungeonPlayers.some(p => !p.is_it);
         if (itExists && !survivorsExist) {
             triggerItWin();
@@ -385,7 +393,6 @@ export default function Game({ session }) {
             if (gData) updateGlobalState(gData);
         };
 
-        // --- FIXED UPDATE PLAYER STATE ---
         const updatePlayerState = (p) => {
             const name = p.profiles?.username || 'Unknown';
             const lastSeenTime = new Date(p.last_seen_at).getTime();
@@ -416,14 +423,11 @@ export default function Game({ session }) {
                 }
             } else {
                 const player = engine.players[p.id];
-                
-                // Sprite Swap if role changes
                 if (player.is_it !== p.is_it) {
                     player.sprite = p.is_it ? createAnokoSprite() : createChiikawaSprite();
                 }
                 
-                // --- CRITICAL FIX: Update local player object properties ---
-                player.lobby_id = p.lobby_id; // Update for EVERYONE including me
+                player.lobby_id = p.lobby_id; 
                 player.is_it = p.is_it;
                 player.status = p.status;
                 player.commandAnimation = p.command_animation;
@@ -435,7 +439,6 @@ export default function Game({ session }) {
                     player.facing = p.facing;
                     player.chatBubble.setTypingStatus(p.is_typing);
                 } else {
-                    // Local Player Transition Logic
                     if (engine.gameState.myLobby !== p.lobby_id) {
                         handleLobbyTransition(p.lobby_id, p.is_it);
                         engine.gameState.isStarting = false; 
@@ -456,6 +459,10 @@ export default function Game({ session }) {
             }
             gs.isActive = data.is_active;
             gs.winner = data.winner;
+
+            if (!gs.winner) {
+                winTriggeredRef.current = false;
+            }
 
             if (data.winner && !resetTimerRef.current) {
                 resetTimerRef.current = setTimeout(async () => {
@@ -724,11 +731,9 @@ export default function Game({ session }) {
             
             // --- TIMER WIN LOGIC ---
             if (lobby === 'dungeon' && engine.gameState.isActive && engine.gameState.matchEndTime) {
-                if (Date.now() >= engine.gameState.matchEndTime && !engine.gameState.winner) {
-                    // Trigger Survivor Win if time runs out
-                    if (myPlayer && myPlayer.is_it) {
-                        triggerSurvivorWin();
-                    }
+                if (Date.now() >= engine.gameState.matchEndTime && !engine.gameState.winner && !winTriggeredRef.current) {
+                    // TIME UP -> SURVIVORS WIN
+                    triggerSurvivorWin();
                 }
             }
         };
@@ -769,14 +774,12 @@ export default function Game({ session }) {
                 const centerX = PORTAL_BOX.x + PORTAL_BOX.w / 2;
                 const centerY = PORTAL_BOX.y + PORTAL_BOX.h / 2;
                 ctx.fillStyle = "#555"; ctx.font = "bold 12px monospace"; ctx.textAlign = "center";
-                ctx.fillText("Dungeon Queue", centerX, centerY - 15);
+                ctx.fillText("Explore Forest", centerX, centerY - 15);
                 const count = engine.gameState.playersInPortal;
                 
-                // --- UPDATED QUEUE TEXT: "Need X more" ---
                 if (count < MIN_PLAYERS_TO_START) {
                     ctx.font = "bold 14px monospace";
                     const needed = MIN_PLAYERS_TO_START - count;
-                    const s = needed === 1 ? "" : "s";
                     ctx.fillText(`Need ${needed} more to start`, centerX, centerY + 15);
                 } else {
                      ctx.fillStyle = "#ff4444"; ctx.font = "bold 24px monospace";
@@ -823,16 +826,12 @@ export default function Game({ session }) {
                 if (player.shadow && player.shadow.isLoaded) {
                     ctx.drawImage(player.shadow.image, player.pos.x - 32, player.pos.y + -22.5, 64, 32);
                 }
+                
                 if (player.is_it) {
                     ctx.fillStyle = "rgba(255, 0, 0, 0.4)";
                     ctx.beginPath(); ctx.arc(player.pos.x, player.pos.y, 35, 0, Math.PI*2); ctx.fill(); 
-
-                    // --- VISIBILITY SAFEGUARD ---
-                    // Draws a red circle around self if IT, ensuring you see yourself even if sprite is bugged
                     if (player.isMe) {
-                        ctx.strokeStyle = "red";
-                        ctx.lineWidth = 3;
-                        ctx.stroke();
+                        ctx.strokeStyle = "red"; ctx.lineWidth = 3; ctx.stroke();
                     }
                 }
 
@@ -905,16 +904,51 @@ export default function Game({ session }) {
                 }
             }
 
+            // --- FINAL UI (WIN/LOSS OVERLAYS) ---
             if (lobby === 'dungeon') {
                 const winner = engine.gameState.winner;
                 if (winner) {
-                    ctx.fillStyle = "rgba(0,0,0,0.85)"; ctx.fillRect(0, 0, vw, vh);
-                    ctx.font = "bold 60px Comic Sans MS"; ctx.textAlign = "center";
-                    if (winner === 'it') { ctx.fillStyle = "#ff4444"; ctx.fillText("IT WINS!", vw/2, vh/2); } 
-                    else { ctx.fillStyle = "#a8e6cf"; ctx.fillText("SURVIVORS WIN!", vw/2, vh/2); }
-                    ctx.fillStyle = "white"; ctx.font = "20px monospace"; ctx.fillText("Returning to lobby in 5s...", vw/2, vh/2 + 60);
-                    ctx.font = "16px monospace"; ctx.fillText("(Click screen to return immediately)", vw/2, vh/2 + 90);
+                    // Dark Overlay for all end screens
+                    ctx.fillStyle = "rgba(0,0,0,0.85)"; 
+                    ctx.fillRect(0, 0, vw, vh);
+
+                    ctx.textAlign = "center";
+
+                    // SURVIVORS WIN SCENARIO
+                    if (winner === 'survivors') {
+                        // Specific "YOU SURVIVED" Screen if Alive & Not IT
+                        if (myPlayer && !myPlayer.is_it && myPlayer.status === 'alive') {
+                             ctx.fillStyle = "#66ff66"; // Bright Green
+                             ctx.font = "bold 60px Comic Sans MS";
+                             ctx.fillText("YOU SURVIVED!", vw/2, vh/2 - 20);
+                             
+                             ctx.fillStyle = "white";
+                             ctx.font = "20px monospace";
+                             ctx.fillText("(The monster is gone)", vw/2, vh/2 + 30);
+                        } 
+                        // Generic "Survivors Win" (For Dead players or the IT player)
+                        else {
+                             ctx.fillStyle = "#a8e6cf"; 
+                             ctx.font = "bold 60px Comic Sans MS";
+                             ctx.fillText("SURVIVORS WIN!", vw/2, vh/2);
+                        }
+                    } 
+                    // IT WINS SCENARIO
+                    else if (winner === 'it') {
+                        ctx.fillStyle = "#ff4444"; 
+                        ctx.font = "bold 60px Comic Sans MS";
+                        ctx.fillText("IT WINS!", vw/2, vh/2);
+                    }
+
+                    // RETURN INFO
+                    ctx.fillStyle = "white"; 
+                    ctx.font = "20px monospace"; 
+                    ctx.fillText("Returning to lobby in 5s...", vw/2, vh/2 + 80);
+                    ctx.font = "16px monospace"; 
+                    ctx.fillText("(Click screen to return immediately)", vw/2, vh/2 + 110);
+
                 } else if (engine.gameState.matchEndTime) {
+                    // IN-GAME TIMER
                     const timeLeft = Math.max(0, Math.ceil((engine.gameState.matchEndTime - Date.now()) / 1000));
                     ctx.textAlign = "center";
                     const mins = Math.floor(timeLeft / 60); const secs = timeLeft % 60;
@@ -923,11 +957,13 @@ export default function Game({ session }) {
                     ctx.strokeText(timeText, vw/2, 65); 
                     ctx.fillStyle = timeLeft < 30 ? "#ff4444" : "white"; ctx.fillText(timeText, vw/2, 65); 
                     
+                    // DEATH SCREEN (Spectator)
                     if (myPlayer && myPlayer.status === 'dead') {
-                        ctx.fillStyle = "rgba(255, 0, 0, 0.2)"; ctx.fillRect(0, 0, vw, vh);
-                        ctx.fillStyle = "white"; ctx.font = "bold 50px Comic Sans MS"; ctx.textAlign = "center";
+                        ctx.fillStyle = "rgba(255, 0, 0, 0.3)"; ctx.fillRect(0, 0, vw, vh);
+                        ctx.fillStyle = "#ffaaaa"; ctx.font = "bold 50px Comic Sans MS"; ctx.textAlign = "center";
                         ctx.fillText("YOU DIED", vw/2, vh/2 - 20);
-                        ctx.font = "20px monospace"; ctx.fillText("(Spectator Mode Active)", vw/2, vh/2 + 20);
+                        ctx.font = "20px monospace"; ctx.fillStyle = "white";
+                        ctx.fillText("(Spectator Mode Active)", vw/2, vh/2 + 30);
                     }
                 }
             }
