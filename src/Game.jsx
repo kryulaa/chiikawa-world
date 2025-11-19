@@ -4,7 +4,7 @@ import { resources } from './Resources';
 import { Gameloop } from './Gameloop';
 import { Input } from './Input'; 
 import { Vector2 } from './Vector2';
-import { Camera } from './camera';
+import { Camera } from './Camera';
 import { Sprite } from './Sprite';
 import { Animations } from './Animations';
 import { FrameIndexPattern } from './frameindexpattern';
