@@ -26,7 +26,7 @@ const getDistance = (p1, p2) => {
 };
 
 // --- CONFIGURATION ---
-const WORLD_SIZE = 1200; 
+const WORLD_SIZE = 1500; 
 const PORTAL_BOX = { x: 300, y: 50, w: 200, h: 200 }; 
 
 const COUNTDOWN_SECONDS = 10;
@@ -227,7 +227,8 @@ export default function Game({ session }) {
             matchEndTime: null,
             isActive: false,
             winner: null,
-            isStarting: false 
+            isStarting: false,
+            returnTime: null 
         },
         localState: {
             lastDirection: "RIGHT",
@@ -240,7 +241,6 @@ export default function Game({ session }) {
     const resetTimerRef = useRef(null);
 
     // --- SPRITE CREATION ---
-
     const createChiikawaSprite = () => {
         const s = new Sprite({
             resource: resources.images.chiikawa,
@@ -283,9 +283,19 @@ export default function Game({ session }) {
         winTriggeredRef.current = true; 
         console.log("Triggering Survivor Win");
         
+        // 1. OPTIMISTIC UPDATE
+        const gs = engineRef.current.gameState;
+        if (!gs.winner) {
+            gs.winner = 'survivors';
+            gs.isActive = false;
+            // Set countdown immediately so it appears on screen
+            gs.returnTime = Date.now() + 5000;
+        }
+
+        // 2. SERVER CALL
         const { error } = await supabase.rpc('trigger_survivor_win');
         if (error) {
-            console.error("RPC Error, falling back:", error);
+            console.error("RPC Error, using fallback:", error);
             await supabase.from('game_state').update({ winner: 'survivors', is_active: false }).eq('id', 1);
         }
     };
@@ -295,6 +305,15 @@ export default function Game({ session }) {
         winTriggeredRef.current = true;
         console.log("Triggering IT Win");
         
+        // 1. OPTIMISTIC UPDATE
+        const gs = engineRef.current.gameState;
+        if (!gs.winner) {
+            gs.winner = 'it';
+            gs.isActive = false;
+            gs.returnTime = Date.now() + 5000;
+        }
+
+        // 2. SERVER CALL
         const { error } = await supabase.rpc('trigger_it_win');
         if (error) {
              await supabase.from('game_state').update({ winner: 'it', is_active: false }).eq('id', 1);
@@ -336,25 +355,28 @@ export default function Game({ session }) {
         }
     };
 
+    // --- DISCONNECT & WIN LOGIC ---
     const checkDungeonDisconnectWin = () => {
         const gs = engineRef.current.gameState;
+        // If winner already exists (even optimistically), don't re-trigger
         if (!gs.isActive || gs.winner || winTriggeredRef.current) return;
 
         const players = Object.values(engineRef.current.players);
         const dungeonPlayers = players.filter(p => p.lobby_id === 'dungeon' && p.status === 'alive');
 
-        // Check if IT is present in the dungeon
         const itExists = dungeonPlayers.some(p => p.is_it);
         
-        // If IT Disconnected (No IT found in dungeon players) -> Survivors Win
+        // If IT is gone but survivors remain -> Survivors Win
         if (!itExists && dungeonPlayers.length > 0) {
+            console.log("IT Disconnected. Survivors win.");
             triggerSurvivorWin();
             return;
         }
         
-        // If ALL Survivors Disconnected (Only IT found) -> IT Wins
+        // If Survivors are gone but IT remains -> IT Wins
         const survivorsExist = dungeonPlayers.some(p => !p.is_it);
         if (itExists && !survivorsExist) {
+            console.log("All survivors disconnected/dead. IT Wins.");
             triggerItWin();
             return;
         }
@@ -452,16 +474,36 @@ export default function Game({ session }) {
         const updateGlobalState = (data) => {
             if (!data) return;
             const gs = engine.gameState;
+            
             if (data.match_start_time) {
                 gs.matchEndTime = new Date(data.match_start_time).getTime() + (MATCH_DURATION_SECONDS * 1000);
             } else {
                 gs.matchEndTime = null;
             }
+            
             gs.isActive = data.is_active;
-            gs.winner = data.winner;
 
-            if (!gs.winner) {
-                winTriggeredRef.current = false;
+            // *** CRITICAL FIX: PREVENT NULL OVERWRITE ***
+            // If we already have a local winner (via optimistic update), 
+            // and the server sends null, IGNORE the server's null.
+            if (data.winner) {
+                // Server says X won, trust server.
+                const wasNull = gs.winner === null;
+                gs.winner = data.winner;
+                
+                if (wasNull && gs.winner) {
+                    if (!gs.returnTime) gs.returnTime = Date.now() + 5000;
+                }
+            } else {
+                // Server says NO ONE won.
+                // ONLY reset local state if we don't already have a local winner.
+                if (!gs.winner) {
+                     gs.winner = null;
+                     winTriggeredRef.current = false;
+                     gs.returnTime = null;
+                }
+                // If gs.winner is "survivors" (local) but server says null,
+                // we KEEP "survivors" to prevent the screen from disappearing.
             }
 
             if (data.winner && !resetTimerRef.current) {
@@ -469,7 +511,8 @@ export default function Game({ session }) {
                     await supabase.rpc('return_to_lobby');
                     resetTimerRef.current = null; 
                 }, 5000);
-            } else if (!data.winner && resetTimerRef.current) {
+            } else if (!data.winner && resetTimerRef.current && !gs.winner) {
+                // Only clear timer if we truly believe there is no winner
                 clearTimeout(resetTimerRef.current);
                 resetTimerRef.current = null;
             }
@@ -526,7 +569,6 @@ export default function Game({ session }) {
             const lobby = engine.gameState.myLobby;
             const input = engine.input;
 
-            // Disconnect Logic
             Object.keys(engine.players).forEach(key => {
                 const p = engine.players[key];
                 if (!p.isMe) {
@@ -729,10 +771,8 @@ export default function Game({ session }) {
                 }
             }
             
-            // --- TIMER WIN LOGIC ---
             if (lobby === 'dungeon' && engine.gameState.isActive && engine.gameState.matchEndTime) {
                 if (Date.now() >= engine.gameState.matchEndTime && !engine.gameState.winner && !winTriggeredRef.current) {
-                    // TIME UP -> SURVIVORS WIN
                     triggerSurvivorWin();
                 }
             }
@@ -774,12 +814,13 @@ export default function Game({ session }) {
                 const centerX = PORTAL_BOX.x + PORTAL_BOX.w / 2;
                 const centerY = PORTAL_BOX.y + PORTAL_BOX.h / 2;
                 ctx.fillStyle = "#555"; ctx.font = "bold 12px monospace"; ctx.textAlign = "center";
-                ctx.fillText("Explore Forest", centerX, centerY - 15);
+                ctx.fillText("Explore the forest", centerX, centerY - 15);
                 const count = engine.gameState.playersInPortal;
                 
                 if (count < MIN_PLAYERS_TO_START) {
                     ctx.font = "bold 14px monospace";
                     const needed = MIN_PLAYERS_TO_START - count;
+                    const s = needed === 1 ? "" : "s";
                     ctx.fillText(`Need ${needed} more to start`, centerX, centerY + 15);
                 } else {
                      ctx.fillStyle = "#ff4444"; ctx.font = "bold 24px monospace";
@@ -826,7 +867,6 @@ export default function Game({ session }) {
                 if (player.shadow && player.shadow.isLoaded) {
                     ctx.drawImage(player.shadow.image, player.pos.x - 32, player.pos.y + -22.5, 64, 32);
                 }
-                
                 if (player.is_it) {
                     ctx.fillStyle = "rgba(255, 0, 0, 0.4)";
                     ctx.beginPath(); ctx.arc(player.pos.x, player.pos.y, 35, 0, Math.PI*2); ctx.fill(); 
@@ -877,10 +917,10 @@ export default function Game({ session }) {
                 if (isHeadstart) {
                     ctx.fillStyle = "black"; ctx.fillRect(0, 0, vw, vh); 
                     ctx.fillStyle = "red"; ctx.font = "bold 30px monospace"; ctx.textAlign = "center";
-                    ctx.fillText("WAKING UP...", vw/2, vh/2 - 20);
+                    ctx.fillText("You feel hungry.. Waking up.", vw/2, vh/2 - 20);
                     const remainingWait = Math.ceil(HEADSTART_SECONDS - timeElapsed);
                     ctx.fillStyle = "white"; ctx.fillText(remainingWait, vw/2, vh/2 + 30);
-                    ctx.font = "16px monospace"; ctx.fillText("Survivors are hiding.", vw/2, vh/2 + 60);
+                    ctx.font = "16px monospace"; ctx.fillText("Time to hunt.", vw/2, vh/2 + 60);
                 } else {
                     const cx = vw / 2; const cy = vh / 2;
                     const visionRadius = 250 + Math.sin(Date.now() / 200) * 10;
@@ -904,51 +944,56 @@ export default function Game({ session }) {
                 }
             }
 
-            // --- FINAL UI (WIN/LOSS OVERLAYS) ---
+            // --- UI LAYER (WIN SCREENS) ---
             if (lobby === 'dungeon') {
                 const winner = engine.gameState.winner;
                 if (winner) {
-                    // Dark Overlay for all end screens
-                    ctx.fillStyle = "rgba(0,0,0,0.85)"; 
-                    ctx.fillRect(0, 0, vw, vh);
-
+                    ctx.fillStyle = "rgba(0,0,0,0.85)"; ctx.fillRect(0, 0, vw, vh);
                     ctx.textAlign = "center";
 
-                    // SURVIVORS WIN SCENARIO
-                    if (winner === 'survivors') {
-                        // Specific "YOU SURVIVED" Screen if Alive & Not IT
-                        if (myPlayer && !myPlayer.is_it && myPlayer.status === 'alive') {
-                             ctx.fillStyle = "#66ff66"; // Bright Green
-                             ctx.font = "bold 60px Comic Sans MS";
-                             ctx.fillText("YOU SURVIVED!", vw/2, vh/2 - 20);
-                             
-                             ctx.fillStyle = "white";
-                             ctx.font = "20px monospace";
-                             ctx.fillText("(The monster is gone)", vw/2, vh/2 + 30);
-                        } 
-                        // Generic "Survivors Win" (For Dead players or the IT player)
-                        else {
-                             ctx.fillStyle = "#a8e6cf"; 
-                             ctx.font = "bold 60px Comic Sans MS";
-                             ctx.fillText("SURVIVORS WIN!", vw/2, vh/2);
-                        }
-                    } 
-                    // IT WINS SCENARIO
-                    else if (winner === 'it') {
+                    if (winner === 'it') {
+                        // IT WINS
                         ctx.fillStyle = "#ff4444"; 
                         ctx.font = "bold 60px Comic Sans MS";
-                        ctx.fillText("IT WINS!", vw/2, vh/2);
+                        ctx.fillText("Anoko WINS!", vw/2, vh/2 - 40);
+                        
+                        ctx.font = "bold 24px monospace"; 
+                        ctx.fillStyle = "#ffaaaa"; 
+                        ctx.fillText("Anoko has replenished its hunger.", vw/2, vh/2 + 10);
+                    } 
+                    else if (winner === 'survivors') {
+                        // SURVIVORS WIN
+                        ctx.fillStyle = "#66ff66"; 
+                        ctx.font = "bold 60px Comic Sans MS";
+                        ctx.fillText("SURVIVORS WIN!", vw/2, vh/2 - 40);
+
+                        ctx.font = "bold 20px monospace"; 
+                        ctx.fillStyle = "#a8e6cf";
+                        
+                        // To fix "undefined" names if players disconnected, use stored names or fallback
+                        const survivors = Object.values(engine.players)
+                            .filter(p => p.lobby_id === 'dungeon' && !p.is_it && p.status === 'alive')
+                            .map(p => p.name);
+                        
+                        let survivorText = "The survivors";
+                        if (survivors.length > 0) {
+                            survivorText = survivors.join(", ");
+                        }
+                        
+                        ctx.fillText(`${survivorText} managed to run away safely from Anoko.`, vw/2, vh/2 + 10);
                     }
 
-                    // RETURN INFO
+                    // COMMON FOOTER
+                    const returnTimer = engine.gameState.returnTime 
+                        ? Math.ceil((engine.gameState.returnTime - Date.now()) / 1000) 
+                        : 5;
+                    const secondsLeft = Math.max(0, returnTimer);
+
                     ctx.fillStyle = "white"; 
                     ctx.font = "20px monospace"; 
-                    ctx.fillText("Returning to lobby in 5s...", vw/2, vh/2 + 80);
-                    ctx.font = "16px monospace"; 
-                    ctx.fillText("(Click screen to return immediately)", vw/2, vh/2 + 110);
-
+                    ctx.fillText(`Returning to lobby in ${secondsLeft} seconds.`, vw/2, vh/2 + 80);
+                    
                 } else if (engine.gameState.matchEndTime) {
-                    // IN-GAME TIMER
                     const timeLeft = Math.max(0, Math.ceil((engine.gameState.matchEndTime - Date.now()) / 1000));
                     ctx.textAlign = "center";
                     const mins = Math.floor(timeLeft / 60); const secs = timeLeft % 60;
@@ -957,13 +1002,11 @@ export default function Game({ session }) {
                     ctx.strokeText(timeText, vw/2, 65); 
                     ctx.fillStyle = timeLeft < 30 ? "#ff4444" : "white"; ctx.fillText(timeText, vw/2, 65); 
                     
-                    // DEATH SCREEN (Spectator)
                     if (myPlayer && myPlayer.status === 'dead') {
-                        ctx.fillStyle = "rgba(255, 0, 0, 0.3)"; ctx.fillRect(0, 0, vw, vh);
-                        ctx.fillStyle = "#ffaaaa"; ctx.font = "bold 50px Comic Sans MS"; ctx.textAlign = "center";
+                        ctx.fillStyle = "rgba(255, 0, 0, 0.2)"; ctx.fillRect(0, 0, vw, vh);
+                        ctx.fillStyle = "white"; ctx.font = "bold 50px Comic Sans MS"; ctx.textAlign = "center";
                         ctx.fillText("YOU DIED", vw/2, vh/2 - 20);
-                        ctx.font = "20px monospace"; ctx.fillStyle = "white";
-                        ctx.fillText("(Spectator Mode Active)", vw/2, vh/2 + 30);
+                        ctx.font = "20px monospace"; ctx.fillText("(Spectator Mode Active)", vw/2, vh/2 + 20);
                     }
                 }
             }
