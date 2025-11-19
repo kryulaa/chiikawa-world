@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { supabase } from '../supabaseClient';
-import { resources } from './resources';
-import { Gameloop } from './gameloop';
+import { resources } from './Resources';
+import { Gameloop } from './Gameloop';
 import { Input } from './Input'; 
 import { Vector2 } from './Vector2';
 import { Camera } from './camera';
