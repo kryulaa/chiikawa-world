@@ -1,3 +1,4 @@
+//This animations for our chikawa game
 import { FrameIndexPattern } from "./FrameIndexPattern";
 
 export class Animations {
